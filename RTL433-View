@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+# --- Colors ---
+BLAU='\033[34m'        # active weather sensors
+HELLGRAU='\033[37m'    # active tire sensors (TPMS)
+GRAU='\033[90m'        # stale (>4 min)
+WEISS='\033[37m'       # temperature (value only)
+ROTBLINK='\033[5;31m'  # LOG active
+NORMAL='\033[0m'
+CYAN='\033[1;36m'
+
+command -v rtl_433 >/dev/null || { echo "Error: rtl_433 not found."; exit 1; }
+command -v jq >/dev/null || { echo "Error: jq not found."; exit 1; }
+
+# --- Frequency (adjust here) ---
+FREQ_HZ=433920000
+FREQ_DISP="433.92"
+
+declare -A ZEIT MODELL ID TEMP FEUCHTE BATTERIE DRUCK SIGNAL
+STALE=240  # 4 minutes in seconds
+
+# --- Received packet counter (all models/packets) ---
+RXPKS=0
+
+LOG_FLAG="/tmp/rtl433_log_active"
+LOG_FILE=""
+rm -f "$LOG_FLAG"
+
+(
+  while IFS= read -r -n1 -s key </dev/tty; do
+    case "${key,,}" in
+      [Ll])
+        if [[ -f "$LOG_FLAG" ]]; then rm -f "$LOG_FLAG"; else touch "$LOG_FLAG"; fi
+        ;;
+    esac
+  done
+) &
+KEYPID=$!
+
+trap 'kill "$KEYPID" 2>/dev/null; printf "\n\033[0mStopped.\n"; exit 0' INT TERM
+
+# --- Determine SDR device from rtl_433 stderr (once) ---
+DEVICE="RTL-SDR"
+for i in 1 2 3 4 5; do
+    if grep -q "Using device" /tmp/rtl433_err 2>/dev/null; then
+        DEVICE=$(grep -m1 "Using device" /tmp/rtl433_err | sed 's/.*Using device 0: //')
+        break
+    fi
+    sleep 1
+done
+
+# --- Header: line1 = title | center | date; line2 = hint | LOG active (far right) ---
+zeichne_kopf() {
+    local now=$1
+    local LOG_ACTIVE=0
+    [[ -f "$LOG_FLAG" ]] && LOG_ACTIVE=1
+
+    local cols right center lw rw cw gap gapfree pad1 pad2
+    cols=$(tput cols 2>/dev/null || echo 80)
+    local title="RTL_433 Sensor Table"
+    right="$(date -d "@$now" '+%d.%m.%Y %H:%M:%S')"
+    center="Device: ${DEVICE}  |  ${FREQ_DISP} MHz  |  RXPKS: ${RXPKS}"
+
+    lw=${#title}; rw=${#right}; cw=${#center}
+    gap=$(( cols - lw - rw ))
+    gapfree=$(( gap - cw ))
+
+    # Space left of the center block (adjust freely)
+    local PAD=30
+    pad1=$PAD; (( pad1 < 1 )) && pad1=1
+    pad2=$(( gapfree - pad1 )); (( pad2 < 1 )) && pad2=1
+
+    # Line 1
+    printf "${CYAN}%-${lw}s${NORMAL}%${pad1}s${CYAN}%s${NORMAL}%${pad2}s${CYAN}%${rw}s${NORMAL}\n" \
+        "$title" "" "$center" "" "$right"
+
+    # Line 2: hint left, LOG active far right
+    local hint="Exit with Ctrl+C   (Press L to toggle log)"
+    local log=""
+    if (( LOG_ACTIVE )); then
+        log="${ROTBLINK}LOG active${NORMAL}"
+    fi
+    printf "%-${#hint}s%$(( cols - ${#hint} - ${#log} ))s${log}\n" "$hint" ""
+
+    printf '\n'
+}
+
+zeichne() {
+    local now=$1
+    clear
+    zeichne_kopf "$now"
+
+    printf '%-22s %-24s %-10s %-10s %-10s %-10s %-12s %-8s\n' \
+      "Time" "Model" "ID" "Temp °C" "Humidity" "Battery" "Pressure (TPMS)" "Signal"
+    printf '%s\n' \
+      "--------------------------------------------------------------------------------------------------------------"
+
+    for k in "${!ZEIT[@]}"; do printf '%s\t%s\n' "$k" "${ZEIT[$k]}"; done |
+    sort -t $'\t' -k2 -rn | while IFS=$'\t' read -r k t; do
+        alter=$(( now - t ))
+        if (( alter > STALE )); then
+            farbe="$GRAU"
+        elif [[ "${DRUCK[$k]}" != "-" ]]; then
+            farbe="$HELLGRAU"
+        else
+            farbe="$BLAU"
+        fi
+        zeit=$(date -d "@$t" +%H:%M:%S)
+        printf "${farbe}%-22s %-24s %-10s\033[0m${WEISS}%-10s\033[0m${farbe}%-10s %-10s %-12s %-8s\033[0m\n" \
+          "$zeit" "${MODELL[$k]}" "${ID[$k]}" "${TEMP[$k]}" "${FEUCHTE[$k]}" \
+          "${BATTERIE[$k]}" "${DRUCK[$k]}" "${SIGNAL[$k]}"
+    done
+}
+
+rtl_433 -d 0 -f "$FREQ_HZ" -F json -M time -M protocol 2>/tmp/rtl433_err |
+while :; do
+    now=$(date +%s)
+    rote=false
+
+    if IFS= read -r -t 1 json; then
+        RXPKS=$(( RXPKS + 1 ))
+
+        IFS=$'\t' read -r model id temp hum bat pres sig <<< "$(jq -r '
+          [
+            (.model // "-"),
+            ((.id // .channel // "-") | tostring),
+            (if .temperature_C != null then (.temperature_C | tostring)
+             elif .temperature_F != null then (((.temperature_F - 32) * 5/9) | . * 10 | floor | . / 10 | tostring)
+             elif .temperature != null then (.temperature | tostring)
+             elif .temp != null then (.temp | tostring)
+             else "-" end),
+            (if .humidity != null then (.humidity | tostring) else "-" end),
+            (if .battery_ok != null then (if .battery_ok == 1 then "OK" else "LOW" end)
+             elif .battery_V != null then (.battery_V | tostring)
+             elif .battery != null then (.battery | tostring)
+             else "-" end),
+            (if .pressure_kPa != null then (.pressure_kPa | tostring)
+             elif .pressure_psi != null then (.pressure_psi | tostring)
+             elif .pressure_bar != null then (.pressure_bar | tostring)
+             elif .pressure != null then (.pressure | tostring)
+             else "-" end),
+            (if .rssi != null then (.rssi | tostring)
+             elif .signal_strength != null then (.signal_strength | tostring)
+             elif .signal != null then (.signal | tostring)
+             else "-" end)
+          ] | @tsv
+        ' <<< "$json")"
+
+        key="$model|$id"
+        ZEIT[$key]=$now
+        MODELL[$key]=$model
+        ID[$key]=$id
+        TEMP[$key]=$temp
+        FEUCHTE[$key]=$hum
+        BATTERIE[$key]=$bat
+        DRUCK[$key]=$pres
+        SIGNAL[$key]=$sig
+
+        if [[ -f "$LOG_FLAG" ]]; then
+            if [[ -z "$LOG_FILE" ]]; then
+                LOG_FILE="$(date +%Y-%m-%d-%H-%M-%S).433.log"
+                echo "# rtl_433 log started $(date '+%Y-%m-%d %H:%M:%S')" > "$LOG_FILE"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -d "@$now" +%F_%T)" "$model" "$id" "$temp" "$hum" "$bat" "$pres" "$sig" >> "$LOG_FILE"
+        else
+            LOG_FILE=""
+        fi
+        rote=true
+    fi
+
+    if [[ -z "${LAST_DRAW:-}" ]]; then
+        rote=true
+    elif (( now - LAST_DRAW >= 10 )); then
+        rote=true
+    fi
+
+    if [[ "$rote" == true ]]; then
+        zeichne "$now"
+        LAST_DRAW="$now"
+    fi
+done
