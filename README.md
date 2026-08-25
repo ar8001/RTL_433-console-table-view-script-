@@ -4,7 +4,6 @@ I wrote a small script for the rtl_433 output on Linux that displays all receive
 
 Before running it, you need to install:
 
-Code
 sudo apt install rtl-433 jq
 
 simple copy the file
