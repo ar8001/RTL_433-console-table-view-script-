@@ -12,5 +12,7 @@ simple copy the file
 sudo chmod +x RTL433-view
 
 
+
 be shure rtl_433 is installed an works :) 
 
+<img width="1872" height="990" alt="Bildschirmfoto 2026-08-25 um 18 43 15" src="https://github.com/user-attachments/assets/b9e88193-5889-4146-bcb8-b5149dd4e37c" />
