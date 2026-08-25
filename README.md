@@ -6,3 +6,11 @@ Before running it, you need to install:
 
 Code
 sudo apt install rtl-433 jq
+
+simple copy the file
+
+sudo chmod +x RTL433-view
+
+
+be shure rtl_433 is installed an works :) 
+
